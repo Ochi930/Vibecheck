@@ -13,13 +13,38 @@ security slips, then prints a score, reasons and a fix for each finding.
 Heuristics only: a high score means "likely", never proof.
 """
 import argparse, json, re, sys
+from typing import Callable, Dict, List, Match, Optional, Tuple, TypedDict
 from urllib.parse import urljoin, urlparse
 from urllib.request import Request, urlopen
 
 UA = "Mozilla/5.0 (compatible; vibecheck/1.0)"
 
 
-def fetch(url, limit=2_000_000):
+class Finding(TypedDict):
+    id: str
+    category: str
+    weight: int
+    reason: str
+    fix: str
+    evidence: str
+
+
+class AnalysisContext(TypedDict):
+    url: Optional[str]
+    html: str
+    headers: Dict[str, str]
+    bundles: Dict[str, str]
+    robots: Optional[bool]
+
+
+class AnalysisResult(TypedDict):
+    url: Optional[str]
+    score: int
+    verdict: str
+    findings: List[Finding]
+
+
+def fetch(url: str, limit: int = 2_000_000) -> Tuple[Optional[str], Dict[str, str], Optional[int]]:
     try:
         r = urlopen(Request(url, headers={"User-Agent": UA}), timeout=15)
         return r.read(limit).decode("utf-8", "replace"), dict(r.headers), r.status
@@ -28,9 +53,9 @@ def fetch(url, limit=2_000_000):
 
 
 # (id, category, weight, reason, fix, test) -- test(ctx) -> evidence string or None
-def rx(pattern, flags=re.I):
+def rx(pattern: str, flags: int = re.I) -> Callable[[str], Optional[str]]:
     p = re.compile(pattern, flags)
-    def f(text):
+    def f(text: str) -> Optional[str]:
         m = p.search(text)
         return m.group(0)[:80] if m else None
     return f
@@ -51,21 +76,24 @@ EMOJI_H = rx(r"<h[1-3][^>]*>\s*[\U0001F300-\U0001FAFF\u2600-\u27BF]")
 TODO = rx(r"(TODO|FIXME|placeholder text|coming soon)", 0)
 
 
-def meta(text, name):
+def meta(text: str, name: str) -> Optional[Match[str]]:
     return re.search(r"<meta[^>]+(name|property)=[\"']%s[\"']" % re.escape(name), text, re.I)
 
 
-def tests(ctx):
-    h, hdr, bundles, base = ctx["html"], ctx["headers"], ctx["bundles"], ctx["url"]
+def tests(ctx: AnalysisContext) -> List[Finding]:
+    h, hdr, bundles = ctx["html"], ctx["headers"], ctx["bundles"]
     low = {k.lower(): v for k, v in hdr.items()}
     allsrc = h + "\n" + "\n".join(bundles.values())
     body_text = re.sub(r"<(script|style)[\s\S]*?</\1>|<[^>]+>", " ", h, flags=re.I)
-    F = []
+    F: List[Finding] = []
 
-    def add(id, cat, w, reason, fix, ev=None):
+    def add(id: str, cat: str, w: int, reason: str, fix: str, ev: Optional[str] = None) -> None:
         if ev:
-            F.append(dict(id=id, category=cat, weight=w, reason=reason, fix=fix,
-                          evidence=ev if isinstance(ev, str) else ""))
+            finding: Finding = {
+                "id": id, "category": cat, "weight": w, "reason": reason, "fix": fix,
+                "evidence": ev,
+            }
+            F.append(finding)
 
     add("builder-fingerprint", "Fingerprint", 30, "References an AI app builder (Lovable, Bolt, v0, Replit, Base44...).",
         "Remove builder branding/badges and tags, set your own domain, and review the exported code before shipping.", BUILDERS(allsrc))
@@ -128,28 +156,34 @@ def tests(ctx):
     return F
 
 
-def analyse(url, html, headers):
-    bundles, robots = {}, None
+def analyse(url: Optional[str], html: str, headers: Dict[str, str]) -> AnalysisResult:
+    bundles: Dict[str, str] = {}
+    robots: Optional[bool] = None
     if url:
         srcs = re.findall(r"<script[^>]+src=[\"']([^\"']+)", html, re.I)
         host = urlparse(url).netloc
         for s in srcs:
             u = urljoin(url, s)
             if urlparse(u).netloc == host and len(bundles) < 4:
-                t, _, st = fetch(u, 3_000_000)
+                t, _, _ = fetch(u, 3_000_000)
                 if t:
                     bundles[u] = t
         _, _, st = fetch(urljoin(url, "/robots.txt"), 2000)
         robots = st == 200
-    ctx = dict(url=url, html=html, headers=headers, bundles=bundles, robots=robots)
+    ctx: AnalysisContext = {
+        "url": url, "html": html, "headers": headers, "bundles": bundles, "robots": robots,
+    }
     F = tests(ctx)
     score = min(100, sum(f["weight"] for f in F))
     verdict = ("Very likely vibe coded" if score >= 60 else "Likely vibe coded" if score >= 40
                else "Possibly vibe coded / unpolished" if score >= 20 else "Probably human-reviewed")
-    return dict(url=url, score=score, verdict=verdict, findings=sorted(F, key=lambda f: -f["weight"]))
+    return {
+        "url": url, "score": score, "verdict": verdict,
+        "findings": sorted(F, key=lambda f: -f["weight"]),
+    }
 
 
-def report(r):
+def report(r: AnalysisResult) -> None:
     print("\n%s\nvibecheck: %s\nScore: %d/100  ->  %s\n%s" % ("=" * 64, r["url"] or "local file", r["score"], r["verdict"], "=" * 64))
     if not r["findings"]:
         print("No red flags found.")
@@ -167,13 +201,18 @@ def main():
     ap.add_argument("--file", help="analyse a local HTML file instead")
     ap.add_argument("--json", action="store_true")
     a = ap.parse_args()
+    html: str
+    hdr: Dict[str, str]
+    url: Optional[str]
     if a.file:
         html, hdr, url = open(a.file, encoding="utf-8", errors="replace").read(), {}, None
     elif a.url:
-        url = a.url if a.url.startswith("http") else "https://" + a.url
-        html, hdr, st = fetch(url)
-        if html is None:
+        input_url: str = a.url
+        url = input_url if input_url.startswith("http") else "https://" + input_url
+        fetched_html, hdr, _ = fetch(url)
+        if fetched_html is None:
             sys.exit("Could not fetch %s" % url)
+        html = fetched_html
     else:
         ap.error("give a URL or --file")
     r = analyse(url, html, hdr)
